@@ -1,4 +1,5 @@
 import argparse
+from collections import OrderedDict
 import atexit
 import os
 import re
@@ -212,38 +213,6 @@ TARGET_LANGUAGES = [lang for lang in LANGUAGES if lang[1] != "auto"]
 FORMS = [("常体（だ・である）", "plain"), ("敬体（です・ます）", "polite")]
 
 
-def split_text(text, max_chars=2200):
-    """段落を維持しながら文章を分割する"""
-    paragraphs = re.split(r"\n\s*\n", text)
-    chunks = []
-    current = ""
-
-    for paragraph in paragraphs:
-        paragraph = paragraph.strip()
-        if not paragraph:
-            continue
-
-        while len(paragraph) > max_chars:
-            if current:
-                chunks.append(current)
-                current = ""
-
-            chunks.append(paragraph[:max_chars])
-            paragraph = paragraph[max_chars:]
-
-        if len(current) + len(paragraph) > max_chars:
-            if current:
-                chunks.append(current)
-            current = paragraph
-        else:
-            current += "\n\n" + paragraph if current else paragraph
-
-    if current:
-        chunks.append(current)
-
-    return chunks
-
-
 # ------------------------------------------------------------
 # テキスト翻訳
 # ------------------------------------------------------------
@@ -256,6 +225,70 @@ def _hide_images(md_text):
     """画面に出すときは、埋め込み画像（base64）を目印に置き換えて軽くする"""
     # 途中で切れた（閉じ括弧のない）画像も置き換える
     return re.sub(r"!\[[^\]\n]*\]\(data:[^)\s]*\)?", "*(図)*", md_text)
+
+
+# ------------------------------------------------------------
+# テキスト翻訳のキャッシュ（段落ごと）
+# 入力が変わるたびに訳し直すので、変わっていない段落はキャッシュの訳を使い、
+# 変わった段落だけを翻訳エンジンに送る
+# ------------------------------------------------------------
+_CACHE_MAX = 5000
+_translation_cache = OrderedDict()     # (原文, 翻訳元, 翻訳先, 文体) -> 訳文
+_cache_lock = threading.Lock()
+
+
+def _cache_key(text, source_lang, target_lang, form):
+    return (text, source_lang, target_lang, form if target_lang == "ja" else "")
+
+
+def _cache_put(key, value):
+    with _cache_lock:
+        _translation_cache[key] = value
+        _translation_cache.move_to_end(key)
+        while len(_translation_cache) > _CACHE_MAX:
+            _translation_cache.popitem(last=False)
+
+
+def cached_translate_many(backend, texts, source_lang, target_lang, form, progress=None):
+    """translate_many と同じだが、キャッシュにある原文は翻訳エンジンに送らない"""
+    keys = [_cache_key(t, source_lang, target_lang, form) for t in texts]
+    with _cache_lock:
+        results = [_translation_cache.get(k) for k in keys]
+    todo = sorted({t for t, r in zip(texts, results) if r is None})
+    if todo:
+        done = backend.translate_many(todo, source_lang, target_lang, form, progress=progress)
+        fresh = dict(zip(todo, done))
+        for t, d in fresh.items():
+            _cache_put(_cache_key(t, source_lang, target_lang, form), d)
+        results = [r if r is not None else fresh[t] for t, r in zip(texts, results)]
+    elif progress:
+        progress(len(texts), len(texts))
+    return results
+
+
+def split_paragraphs(text):
+    """段落（空行区切り）に分ける。長すぎる段落は文の切れ目で分ける
+
+    キャッシュが効くよう、段落はまとめずに 1 つずつ訳す。
+    戻り値: [(段落の部品のリスト), ...]
+    """
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    return [paper.split_long(p) for p in paragraphs]
+
+
+def seed_reverse_cache(source_text, translated_text, source_lang, target_lang, form):
+    """⇄ で入れ替えたときに、訳文 -> 原文 の対応を逆向きのキャッシュに入れる
+
+    入れ替え後に少しだけ書き換えたとき、書き換えていない段落を訳し直さずに済む。
+    段落の数が合わないとき（Markdown など）は何もしない。
+    """
+    src = [p.strip() for p in re.split(r"\n\s*\n", source_text or "") if p.strip()]
+    dst = [p.strip() for p in re.split(r"\n\s*\n", translated_text or "") if p.strip()]
+    if not src or len(src) != len(dst):
+        return
+    for s_par, d_par in zip(src, dst):
+        # 新しい向き: 翻訳元 = もとの翻訳先、翻訳先 = もとの翻訳元
+        _cache_put(_cache_key(d_par, target_lang, source_lang, form), s_par)
 
 
 def translate_input_text(text, source_lang, target_lang, form,
@@ -271,16 +304,17 @@ def translate_input_text(text, source_lang, target_lang, form,
         progress(done / total, desc=f"翻訳中 ({done}/{total})")
 
     if not is_markdown_document(text):
-        chunks = split_text(text)
-        results = backend.translate_many(chunks, source_lang, target_lang, form,
-                                         progress=on_progress)
-        return "\n\n".join(results), None
+        parts = split_paragraphs(text)
+        flat = [x for p in parts for x in p]
+        results = iter(cached_translate_many(backend, flat, source_lang, target_lang, form,
+                                             progress=on_progress))
+        return "\n\n".join("".join(next(results) for _ in p) for p in parts), None
 
     # Markdown: 画像・コード・表の記号はそのまま残し、文章だけを訳す
     blocks = paper.parse_blocks(text, mode=paper.DOCUMENT)
     paper.translate_blocks(
         blocks,
-        lambda texts, cb: backend.translate_many(texts, source_lang, target_lang, form, progress=cb),
+        lambda texts, cb: cached_translate_many(backend, texts, source_lang, target_lang, form, cb),
         progress=on_progress,
     )
     md_text = paper.render_markdown(blocks, "")
@@ -304,18 +338,22 @@ def source_label(detected=None):
     return "翻訳元"
 
 
-def auto_translate_text(text, source_lang, target_lang, form, progress=gr.Progress()):
+def auto_translate_text(text, source_lang, target_lang, form, swapped=None, progress=gr.Progress()):
     """入力・言語・文体が変わるたびに呼ぶ（翻訳ボタンは無い）
 
     空欄なら訳文も消す。翻訳エンジンの起動中は、起動が終わるまで待ってから訳す
     （入力のたびにエラーを出さないため）。
     翻訳元が「自動判定」のときは原文の言語を判定し、翻訳元の見出しに出して、⇄ の入れ替えに使う。
-    戻り値: 訳文, 画像入りの訳文ファイル, 翻訳元の欄の更新, 判定した言語
+    swapped は ⇄ で原文欄に入れた文章。原文欄の変化（.change）は入れ替えでも起きるので、
+    その文章のままなら訳し直さない。
+    戻り値: 訳文, 画像入りの訳文ファイル, 翻訳元の欄の更新, 判定した言語, swapped
     """
+    if swapped is not None and text == swapped:
+        return gr.skip(), gr.skip(), gr.skip(), gr.skip(), None
     detected = detect_language(text) if source_lang == "auto" and text else None
     label = gr.update(label=source_label(detected))
     if not text or not text.strip():
-        return "", None, label, None
+        return "", None, label, None, None
     if source_lang == target_lang:
         raise gr.Error("翻訳元と翻訳先が同じ言語です。")
     if vllm_server is not None:
@@ -324,17 +362,22 @@ def auto_translate_text(text, source_lang, target_lang, form, progress=gr.Progre
             progress(0, desc="翻訳モデルの起動を待っています")
             time.sleep(1)
     translated, files = translate_input_text(text, source_lang, target_lang, form, progress)
-    return translated, files, label, detected
+    return translated, files, label, detected, None
 
 
-def swap_languages(source_lang, target_lang, text, translated, detected):
-    """翻訳の向きと原文・訳文を入れ替える。自動判定のときは判定した言語を翻訳元として確定させる"""
+def swap_languages(source_lang, target_lang, text, translated, detected, form):
+    """翻訳の向きと原文・訳文を入れ替える。自動判定のときは判定した言語を翻訳元として確定させる
+
+    最後の戻り値は、原文欄に入れた文章（その文章のままなら訳し直さないための目印）。
+    """
     if source_lang == "auto":
         if not detected:
             # まだ判定していない（原文が空など）ときは入れ替えない
-            return gr.update(), target_lang, text, translated, None
+            return gr.update(), target_lang, text, translated, None, None
         source_lang = detected
-    return gr.update(value=target_lang, label=source_label()), source_lang, translated, text, None
+    seed_reverse_cache(text, translated, source_lang, target_lang, form)
+    return (gr.update(value=target_lang, label=source_label()), source_lang, translated, text,
+            None, translated)
 
 
 # ------------------------------------------------------------
@@ -629,6 +672,7 @@ with gr.Blocks(title="PLaMo Translator") as demo:
     with gr.Tab("テキスト翻訳"):
         t_source, t_target, t_form = language_controls("auto", "ja")
         t_detected = gr.State(None)     # 自動判定で判定した原文の言語（⇄ の入れ替えに使う）
+        t_swapped = gr.State(None)      # ⇄ で原文欄に入れた文章（入れ替えでは訳し直さないための目印）
 
         with gr.Row(elem_id="text-row"):
             text_input = gr.Textbox(
@@ -652,20 +696,21 @@ with gr.Blocks(title="PLaMo Translator") as demo:
         )
         text_files = gr.File(label="画像入りの訳文", file_count="multiple", visible=True)
 
-        # 入力したらすぐ訳す。翻訳中にさらに入力したら、終わったあとに最新の内容で1回だけ訳し直す
-        # （.input はユーザーの操作だけで起きるので、入れ替えボタンでは訳し直さない）
-        for event in (text_input.input, t_source.input, t_target.input, t_form.input):
+        # 入力・貼り付けしたらすぐ訳す。翻訳中にさらに入力したら、終わったあとに最新の内容で1回だけ訳し直す
+        # 原文欄は .change で受ける（.input は貼り付けでは起きず、Enter を押すまで訳されなかった）。
+        # .change は ⇄ の入れ替えでも起きるので、入れ替えた直後の文章は t_swapped を目印に飛ばす
+        for event in (text_input.change, t_source.input, t_target.input, t_form.input):
             event(
                 fn=auto_translate_text,
-                inputs=[text_input, t_source, t_target, t_form],
-                outputs=[text_output, text_files, t_source, t_detected],
+                inputs=[text_input, t_source, t_target, t_form, t_swapped],
+                outputs=[text_output, text_files, t_source, t_detected, t_swapped],
                 trigger_mode="always_last",
                 show_progress="minimal",
             )
         swap_button.click(
             fn=swap_languages,
-            inputs=[t_source, t_target, text_input, text_output, t_detected],
-            outputs=[t_source, t_target, text_input, text_output, t_detected]
+            inputs=[t_source, t_target, text_input, text_output, t_detected, t_form],
+            outputs=[t_source, t_target, text_input, text_output, t_detected, t_swapped]
         )
 
     with gr.Tab("PDF・文書翻訳"):
