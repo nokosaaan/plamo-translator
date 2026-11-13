@@ -1,4 +1,7 @@
 import argparse
+from typing import List, Optional
+from dataclasses import dataclass
+import queue
 from collections import OrderedDict
 import atexit
 import os
@@ -164,11 +167,16 @@ def switch_model(model_path):
         raise gr.Error("この起動方法ではモデルを切り替えられません。")
     if model_path == vllm_server.model_path and vllm_server.ready:
         return engine_status(), gr.update(value=model_path)
-    _backend = None
+    if not _engine_lock.acquire(blocking=False):
+        raise gr.Error("PDF の翻訳中はモデルを切り替えられません。終わってから切り替えてください。")
     try:
-        vllm_server.switch(model_path)
-    except Exception as e:
-        gr.Warning(vllm_server.message or str(e))
+        _backend = None
+        try:
+            vllm_server.switch(model_path)
+        except Exception as e:
+            gr.Warning(vllm_server.message or str(e))
+    finally:
+        _engine_lock.release()
     if vllm_server.ready:
         _backend = VllmBackend(args.vllm_url)
     return engine_status(), gr.update(value=vllm_server.model_path)
@@ -353,15 +361,20 @@ def auto_translate_text(text, source_lang, target_lang, form, swapped=None, prog
     detected = detect_language(text) if source_lang == "auto" and text else None
     label = gr.update(label=source_label(detected))
     if not text or not text.strip():
+        _last_text.update(input="", output="")
         return "", None, label, None, None
     if source_lang == target_lang:
         raise gr.Error("翻訳元と翻訳先が同じ言語です。")
-    if vllm_server is not None:
-        deadline = time.time() + vllm_server.startup_timeout
-        while vllm_server.state == "starting" and time.time() < deadline:
-            progress(0, desc="翻訳モデルの起動を待っています")
-            time.sleep(1)
-    translated, files = translate_input_text(text, source_lang, target_lang, form, progress)
+    # 翻訳エンジンの起動中や、PDF の OCR で一時停止しているあいだは待つ
+    _wait_engine(progress)
+    if isinstance(_backend, TransformersBackend):
+        # Transformers は GPU を同時に使うと VRAM が足りなくなるので、PDF の翻訳と順番にする
+        progress(0, desc="PDF の翻訳が終わるのを待っています")
+        with _engine_lock:
+            translated, files = translate_input_text(text, source_lang, target_lang, form, progress)
+    else:
+        translated, files = translate_input_text(text, source_lang, target_lang, form, progress)
+    _last_text.update(input=text, output=translated, source=source_lang, target=target_lang, form=form)
     return translated, files, label, detected, None
 
 
@@ -440,6 +453,51 @@ def show_chapters(files, mode):
             gr.update(visible=True))
 
 
+def pre_ocr_mode(path, mode, pages=None):
+    """OCR の前に文書の種類を決める（PDF の文字で判定）。文字がほとんど無く決められなければ None"""
+    if mode != "auto":
+        return mode
+    import pymupdf
+
+    with pymupdf.open(path) as doc:
+        numbers = list(pages) if pages is not None else list(range(doc.page_count))
+        text = "\n".join(doc[i].get_text() for i in numbers[:3])
+    if len(text.strip()) < 100:
+        return None
+    return paper.detect_mode(text)
+
+
+def show_ocr_options(files, mode):
+    """PDF を選んだときに、OCR するページの欄を出す（書籍・一般文書で OCR が要るときだけ）
+
+    論文は、出版社や著者が埋め込んだ文字がほぼ正確なので、PDF の文字をそのまま訳す
+    （文字の無いスキャンのページだけ OCR する）。欄は出さない。
+    """
+    hidden = gr.update(visible=False, value="")
+    if not files or len(files) != 1 or not _is_pdf(files[0]) or not ocr.ocr_available():
+        return hidden
+    path = files[0]
+    if pre_ocr_mode(path, mode) == paper.PAPER:
+        return hidden
+    scanned = ocr.find_scanned_pages(path)
+    layered = ocr.find_text_layer_scans(path) if ocr.lighton_available() else []
+    total = len(scanned) + len(layered)
+    if not total:
+        return hidden
+    minutes = max(1, round(total * ocr.seconds_per_page() / 60))
+    detail = []
+    if scanned:
+        detail.append(f"文字の無いページ {len(scanned)}")
+    if layered:
+        detail.append(f"文字の載ったスキャン {len(layered)}（精度が低ければ OCR し直す）")
+    return gr.update(
+        visible=True,
+        info=(f"OCR の対象は {total} ページ（{'、'.join(detail)}）で、全部だと約 {minutes} 分かかります。"
+              "空欄なら全ページ。範囲外のスキャンのページは、PDF の文字があればそれを使い、"
+              "文字の無いページは訳しません。"),
+    )
+
+
 def pdf_markdown(path, pages, mode, with_images, image_dpi, ocr_texts):
     """PDF のページを Markdown にする。OCR したページは OCR の結果を、それ以外は PDF の文字を使う"""
     import pymupdf
@@ -470,12 +528,13 @@ def pdf_markdown(path, pages, mode, with_images, image_dpi, ocr_texts):
 
 
 def load_units(path, mode, page_range, chapter_ids, with_images, image_dpi, stem,
-               use_ocr=False, on_ocr_progress=None):
+               use_ocr=False, on_ocr_progress=None, ocr_range=""):
     """ファイルを読み、(出力の単位のリスト, 文書の種類) を返す
 
     出力の単位は (ファイル名に付ける名前, ブロック列)。書籍の PDF で章を選んだときは章ごと、
     それ以外はファイル全体で1つ。
     use_ocr なら、文字を持たないページ（スキャン）を先に OCR しておく。
+    ocr_range（例 "1-50"）は書籍・一般文書のときだけ使い、OCR するページをその範囲に絞る。
     """
     if not _is_pdf(path):
         with open(path, encoding="utf-8", errors="replace") as f:
@@ -500,18 +559,35 @@ def load_units(path, mode, page_range, chapter_ids, with_images, image_dpi, stem
         targets = pages if pages is not None else list(range(page_count))
 
     ocr_texts = {}
+    skipped = set()      # OCR の範囲外で、文字も無いので訳さないページ
     if use_ocr and ocr.ocr_available():
+        is_paper = pre_ocr_mode(path, mode, targets) == paper.PAPER
         scanned = ocr.find_scanned_pages(path, targets)
         # スキャンの上にすでに文字（スキャナの OCR など）が載っているページ。
-        # LightOnOCR-3 があれば、その文字の精度を確かめ、低ければ OCR し直す
-        recheck = ocr.find_text_layer_scans(path, targets) if ocr.lighton_available() else []
+        # LightOnOCR-3 があれば、その文字の精度を確かめ、低ければ OCR し直す。
+        # 論文は埋め込まれた文字がほぼ正確なので、確かめずにそのまま使う
+        recheck = (ocr.find_text_layer_scans(path, targets)
+                   if ocr.lighton_available() and not is_paper else [])
+        if not is_paper and ocr_range and ocr_range.strip():
+            allowed = set(parse_page_range(ocr_range, page_count) or [])
+            skipped = {p for p in scanned if p not in allowed}
+            scanned = [p for p in scanned if p in allowed]
+            recheck = [p for p in recheck if p in allowed]
         if scanned or recheck:
             ocr_texts = run_ocr_freeing_gpu(path, scanned, on_ocr_progress, recheck)
+    if skipped:
+        targets = [p for p in targets if p not in skipped]
+        pages = targets
+        if not targets:
+            raise gr.Error("OCR するページの範囲の外は文字の無いページだけで、訳せるページがありません。")
 
     if chapters:
         units = []
         for n, ch in enumerate(selected):
-            md_source = pdf_markdown(path, range(ch.start, ch.end), paper.DOCUMENT,
+            ch_pages = [p for p in range(ch.start, ch.end) if p not in skipped]
+            if not ch_pages:
+                continue
+            md_source = pdf_markdown(path, ch_pages, paper.DOCUMENT,
                                      with_images, int(image_dpi), ocr_texts)
             blocks = paper.parse_blocks(md_source, mode=paper.DOCUMENT, title=stem)
             paper.apply_outline(blocks, ch)
@@ -541,7 +617,7 @@ def _slug(title, max_len=40):
 
 def translate_files(files, source_lang, target_lang, form, formats,
                     bilingual, with_images, translate_refs, mode, page_range, image_dpi,
-                    chapter_ids, split_chapters, progress=gr.Progress()):
+                    chapter_ids, split_chapters, ocr_range="", progress=gr.Progress()):
     if not files:
         raise gr.Error("ファイルを選択してください。")
     if not formats:
@@ -570,7 +646,8 @@ def translate_files(files, source_lang, target_lang, form, formats,
                 progress(0, desc=f"{prefix}: {ocr_step['msg']}")
 
         units, doc_mode = load_units(path, mode, page_range, chapter_ids if len(files) == 1 else None,
-                                     with_images, image_dpi, stem, True, on_ocr_progress)
+                                     with_images, image_dpi, stem, True, on_ocr_progress,
+                                     ocr_range if len(files) == 1 else "")
         if not split_chapters and len(units) > 1:
             # 選んだ章を1つのファイルにまとめる（題は先頭の1つだけ残す）
             merged = units[0][1] + [b for _, blocks in units[1:] for b in blocks if b.kind != "title"]
@@ -629,6 +706,144 @@ def translate_files(files, source_lang, target_lang, form, formats,
         output_files = [zip_path] + output_files
 
     return output_files, preview
+
+
+# ------------------------------------------------------------
+# PDF 翻訳のジョブ（画面を離れても止まらず、結果も消えないようにする）
+#
+# 翻訳ボタンの処理（Gradio のイベント）は、ブラウザが画面を離れると結果を受け取れない。
+# そこで、翻訳はサーバー側のジョブとして別スレッドで順番に実行し、画面は 2 秒ごとに
+# ジョブの状態を読みに行く。画面を開き直しても、実行中の進み具合と終わった結果が出る。
+# ------------------------------------------------------------
+@dataclass
+class PdfJob:
+    id: int
+    names: List[str]
+    args: tuple
+    status: str = "waiting"        # waiting / running / done / error
+    fraction: float = 0.0
+    desc: str = ""
+    files: Optional[List[str]] = None
+    preview: str = ""
+    error: str = ""
+    started: float = 0.0
+    finished: float = 0.0
+
+
+class _JobProgress:
+    """translate_files の progress（gr.Progress と同じ呼び方）をジョブの状態に書き込む"""
+
+    def __init__(self, job):
+        self.job = job
+
+    def __call__(self, fraction=None, desc=None, **_):
+        if isinstance(fraction, (int, float)):
+            self.job.fraction = float(fraction)
+        if desc:
+            self.job.desc = desc
+
+
+_jobs: List[PdfJob] = []
+_jobs_lock = threading.Lock()
+_job_queue = queue.Queue()
+_JOBS_KEPT = 10
+
+
+# PDF 翻訳とモデルの切り替えが同時に走らないようにする（切り替えは vLLM の再起動になるため）
+_engine_lock = threading.Lock()
+
+
+def _wait_engine(progress=None, timeout=3600):
+    """翻訳エンジンが使えるようになるまで待つ（起動中・OCR で一時停止中）"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        starting = vllm_server is not None and vllm_server.state == "starting"
+        if not (_ocr_status or starting):
+            return
+        if progress:
+            progress(0, desc=_ocr_status or "翻訳モデルの起動を待っています")
+        time.sleep(1)
+
+
+def _job_worker():
+    while True:
+        job = _job_queue.get()
+        job.status, job.started = "running", time.time()
+        try:
+            with _engine_lock:
+                _wait_engine(_JobProgress(job))
+                job.files, job.preview = translate_files(*job.args, progress=_JobProgress(job))
+            job.status = "done"
+        except Exception as e:          # gr.Error も含めて、理由を画面に出す
+            job.status = "error"
+            job.error = getattr(e, "message", None) or str(e) or type(e).__name__
+        finally:
+            job.finished = time.time()
+
+
+threading.Thread(target=_job_worker, daemon=True).start()
+
+
+def start_pdf_job(files, *args):
+    *args, shown = args
+    if not files:
+        raise gr.Error("ファイルを選択してください。")
+    args = tuple(args)
+    if not args[3]:      # formats
+        raise gr.Error("出力形式を1つ以上選んでください。")
+    with _jobs_lock:
+        job = PdfJob(id=(_jobs[-1].id + 1 if _jobs else 1),
+                     names=[os.path.basename(f) for f in files], args=(list(files),) + args)
+        _jobs.append(job)
+        del _jobs[:-_JOBS_KEPT]
+    _job_queue.put(job)
+    return poll_pdf_jobs(shown)
+
+
+def _fmt_elapsed(sec):
+    sec = int(sec)
+    return f"{sec // 60} 分 {sec % 60} 秒" if sec >= 60 else f"{sec} 秒"
+
+
+def poll_pdf_jobs(shown=None):
+    """ジョブの一覧（Markdown）と、いちばん新しい終わったジョブの結果を返す
+
+    shown は、この画面に出している結果のジョブ番号。同じなら結果の欄は書き換えない
+    （2 秒ごとに同じファイルを送り直さないため）。
+    """
+    with _jobs_lock:
+        jobs = list(_jobs)
+    if not jobs:
+        return gr.update(value="", visible=False), gr.skip(), gr.skip(), shown
+    lines = []
+    for job in reversed(jobs):
+        name = "、".join(job.names)
+        if job.status == "waiting":
+            lines.append(f"- ⏸ #{job.id} {name} — 順番待ち")
+        elif job.status == "running":
+            lines.append(f"- ⏳ #{job.id} {name} — {int(job.fraction * 100)}%　{job.desc}"
+                         f"（{_fmt_elapsed(time.time() - job.started)}経過）")
+        elif job.status == "done":
+            lines.append(f"- ✅ #{job.id} {name} — 完了（{_fmt_elapsed(job.finished - job.started)}）")
+        else:
+            lines.append(f"- ⚠️ #{job.id} {name} — 失敗: {job.error}")
+    latest = next((j for j in reversed(jobs) if j.status == "done"), None)
+    status = gr.update(value="**翻訳の状況**（画面を離れても続きます）\n\n" + "\n".join(lines),
+                       visible=True)
+    if latest is None or latest.id == shown:
+        return status, gr.skip(), gr.skip(), shown
+    return status, latest.files, latest.preview, latest.id
+
+
+# ------------------------------------------------------------
+# テキスト翻訳の最後の内容（画面を開き直したときに戻す）
+# ------------------------------------------------------------
+_last_text = {"input": "", "output": "", "source": "auto", "target": "ja", "form": "plain"}
+
+
+def restore_text():
+    t = _last_text
+    return t["input"], t["output"], t["source"], t["target"], t["form"]
 
 
 def language_controls(default_source="en", default_target="ja"):
@@ -739,6 +954,11 @@ with gr.Blocks(title="PLaMo Translator") as demo:
         )
         p_split = gr.Checkbox(True, label="章ごとにファイルを分ける（ZIPにもまとめます）",
                               visible=False)
+        # スキャンした書籍の PDF を1つ選んだときだけ出す（論文では出さない）
+        p_ocr_pages = gr.Textbox(
+            label="OCR するページ（書籍・一般文書のスキャン。空欄で全ページ）",
+            placeholder="例: 1-50", visible=False,
+        )
         with gr.Row():
             p_formats = gr.CheckboxGroup(
                 ["HTML", "Markdown"], value=["HTML", "Markdown"], label="出力形式"
@@ -759,8 +979,11 @@ with gr.Blocks(title="PLaMo Translator") as demo:
             variant="primary"
         )
 
+        job_status = gr.Markdown(visible=False)
+        p_shown = gr.State(None)        # この画面に出している結果のジョブ番号
+
         output_file = gr.File(
-            label="翻訳結果",
+            label="翻訳結果（いちばん新しく終わったもの）",
             file_count="multiple"
         )
 
@@ -769,14 +992,25 @@ with gr.Blocks(title="PLaMo Translator") as demo:
 
         for event in (pdf_input.change, p_mode.change):
             event(show_chapters, inputs=[pdf_input, p_mode], outputs=[p_chapters, p_split])
+            event(show_ocr_options, inputs=[pdf_input, p_mode], outputs=p_ocr_pages)
 
+        # 翻訳はサーバー側のジョブとして動かし、画面は 2 秒ごとに状態を読みに行く
         translate_button.click(
-            fn=translate_files,
+            fn=start_pdf_job,
             inputs=[pdf_input, p_source, p_target, p_form, p_formats,
                     p_bilingual, p_images, p_refs, p_mode, p_pages, p_dpi,
-                    p_chapters, p_split],
-            outputs=[output_file, preview_md]
+                    p_chapters, p_split, p_ocr_pages, p_shown],
+            outputs=[job_status, output_file, preview_md, p_shown],
+            queue=False,
         )
+        gr.Timer(2).tick(poll_pdf_jobs, inputs=p_shown,
+                         outputs=[job_status, output_file, preview_md, p_shown],
+                         concurrency_limit=None, show_progress="hidden")
+
+    # 画面を開き直したら（再読み込み・別の画面から戻ったとき）、前の内容を戻す
+    demo.load(poll_pdf_jobs, inputs=p_shown, outputs=[job_status, output_file, preview_md, p_shown],
+              queue=False)
+    demo.load(restore_text, outputs=[text_input, text_output, t_source, t_target, t_form], queue=False)
 
 
     # モデルの切り替え: 実行中は翻訳ボタンを押せないようにして、終わったら戻す
