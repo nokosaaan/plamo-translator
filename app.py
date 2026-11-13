@@ -107,30 +107,43 @@ def engine_status():
     return f"✅ `{_backend.name}` で翻訳できます"
 
 
-def run_ocr_freeing_gpu(path, pages, on_progress):
+def can_free_gpu():
+    """OCR のために翻訳エンジンを止めて GPU を空けられるか（アプリが vLLM を起動したときだけ）"""
+    return vllm_server is not None and not isinstance(_backend, TransformersBackend)
+
+
+def run_ocr_freeing_gpu(path, pages, on_progress, recheck=()):
     """翻訳エンジンを止めて GPU を空け、OCR してから翻訳エンジンを起動し直す
 
-    Unlimited-OCR は GPU メモリを約 6.8 GiB 使うため、8 GB の GPU では翻訳用の
-    vLLM サーバーと同時に動かせない。
+    8 GB の GPU では、OCR のモデルと翻訳用の vLLM サーバーを同時に動かせない
+    （Unlimited-OCR は約 6.8 GiB、LightOnOCR-3 は小さいが vLLM 同士でメモリを分け合えない）。
+    recheck は、すでに文字が載っているスキャンのページ（精度を確かめ、低ければ OCR し直す）。
     """
     global _backend, _ocr_status
+    if not pages and not can_free_gpu():
+        # 文字の載ったスキャンだけなら、OCR をあきらめて既存の文字で訳す
+        return {}
     if isinstance(_backend, TransformersBackend):
         raise gr.Error("OCR は vLLM で翻訳しているときだけ使えます"
                        "（Transformers の翻訳モデルが GPU を使ったままになるため）。")
     restart = vllm_server.model_path if vllm_server is not None and vllm_server.process else None
-    _ocr_status = f"📷 OCR 中（{len(pages)} ページ）のため、翻訳エンジンを一時停止しています"
+    _ocr_status = f"📷 OCR（{ocr.engine_name()}）のため、翻訳エンジンを一時停止しています"
     try:
         if restart:
             _backend = None
             vllm_server.stop()
-        free = ocr.gpu_free_mib()
-        if free is not None and free < ocr.REQUIRED_FREE_MIB:
-            raise gr.Error(
-                f"OCR に必要な GPU メモリが空いていません（空き {free} MiB、必要 約 {ocr.REQUIRED_FREE_MIB} MiB）。"
-                "手動で起動した vLLM サーバー（serve.sh）などを止めてから実行してください。"
-            )
+        problem = ocr.check_gpu()
+        if problem:
+            raise gr.Error(problem + "手動で起動した vLLM サーバー（serve.sh）などを止めてから実行してください。")
+
+        def on_message(msg):
+            global _ocr_status
+            _ocr_status = f"📷 {msg}（そのあいだ翻訳エンジンを一時停止しています）"
+            on_progress(0, 0, msg)
+
         try:
-            return ocr.run_ocr(path, pages, on_progress)
+            return ocr.run_ocr(path, pages, lambda done, total: on_progress(done, total, None),
+                               recheck=recheck, on_message=on_message)
         except RuntimeError as e:
             raise gr.Error(str(e))
     finally:
@@ -394,6 +407,7 @@ def pdf_markdown(path, pages, mode, with_images, image_dpi, ocr_texts):
             return paper.pdf_to_markdown(path, with_images=with_images, mode=mode,
                                          pages=pages, image_dpi=image_dpi)
         parts, run = [], []
+        skip_titles = ocr.running_titles(ocr_texts)
 
         def flush():
             if run:
@@ -404,7 +418,8 @@ def pdf_markdown(path, pages, mode, with_images, image_dpi, ocr_texts):
         for p in page_list:
             if p in ocr_texts:
                 flush()
-                parts.append(ocr.ocr_to_markdown(ocr_texts[p], doc[p], with_images, image_dpi))
+                parts.append(ocr.ocr_to_markdown(ocr_texts[p], doc[p], with_images, image_dpi,
+                                                 skip_titles))
             else:
                 run.append(p)
         flush()
@@ -444,8 +459,11 @@ def load_units(path, mode, page_range, chapter_ids, with_images, image_dpi, stem
     ocr_texts = {}
     if use_ocr and ocr.ocr_available():
         scanned = ocr.find_scanned_pages(path, targets)
-        if scanned:
-            ocr_texts = run_ocr_freeing_gpu(path, scanned, on_ocr_progress)
+        # スキャンの上にすでに文字（スキャナの OCR など）が載っているページ。
+        # LightOnOCR-3 があれば、その文字の精度を確かめ、低ければ OCR し直す
+        recheck = ocr.find_text_layer_scans(path, targets) if ocr.lighton_available() else []
+        if scanned or recheck:
+            ocr_texts = run_ocr_freeing_gpu(path, scanned, on_ocr_progress, recheck)
 
     if chapters:
         units = []
@@ -462,7 +480,8 @@ def load_units(path, mode, page_range, chapter_ids, with_images, image_dpi, stem
     elif any(p in ocr_texts for p in targets[:3]):
         # スキャンしたページを含むときは、冒頭3ページの文字（OCR したページは OCR の結果）で判定する
         with pymupdf.open(path) as doc:
-            head = [ocr.ocr_to_markdown(ocr_texts[p], with_images=False) if p in ocr_texts
+            head = [ocr.ocr_to_markdown(ocr_texts[p], with_images=False,
+                                        skip_titles=ocr.running_titles(ocr_texts)) if p in ocr_texts
                     else doc[p].get_text() for p in targets[:3]]
         doc_mode = paper.detect_mode("\n\n".join(head))
     else:
@@ -496,9 +515,16 @@ def translate_files(files, source_lang, target_lang, form, formats,
         prefix = f"[{n + 1}/{len(files)}] {name}"
 
         progress(0, desc=f"{prefix}: 本文を抽出中（書籍1冊では数分かかります）")
-        def on_ocr_progress(done, total):
-            progress(done / max(total, 1),
-                     desc=f"{prefix}: スキャンしたページを OCR 中 ({done}/{total} ページ、1 ページ約 40 秒)")
+        ocr_step = {"msg": "スキャンしたページを OCR 中"}
+
+        def on_ocr_progress(done, total, message=None):
+            if message:
+                ocr_step["msg"] = message
+            if total:
+                progress(done / total, desc=f"{prefix}: {ocr_step['msg']} ({done}/{total} ページ、"
+                                            f"1 ページ約 {ocr.seconds_per_page()} 秒)")
+            else:
+                progress(0, desc=f"{prefix}: {ocr_step['msg']}")
 
         units, doc_mode = load_units(path, mode, page_range, chapter_ids if len(files) == 1 else None,
                                      with_images, image_dpi, stem, True, on_ocr_progress)

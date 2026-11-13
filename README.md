@@ -57,7 +57,7 @@ Linux（ネイティブ）でも同じ手順で動くはずですが、確認し
 | `.venv-vllm/` | vLLM サーバーの仮想環境 | [手順 4](#4-vllm-の環境を作る) |
 | `model-fp8/`, `model-0.8b-fp8/` | FP8 版のモデル（2B / 0.8B） | [手順 3](#3-モデルのサイズを選んでダウンロードする) |
 | `model/`, `model-4bit/` | BF16 版のモデルと、その 4bit 量子化版（Transformers で動かす場合だけ） | [Transformers で動かす](#transformers-で動かすvllm-が使えない場合) |
-| `.venv-ocr/`, `model-ocr/` | OCR（スキャンした PDF を読む場合だけ）の仮想環境とモデル | [スキャンした PDF を読む](#スキャンした-pdf-を読むocr任意) |
+| `model-lighton/`（推奨）, `.venv-ocr/` と `model-ocr/` | OCR（スキャンした PDF を読む場合だけ）のモデルと仮想環境 | [スキャンした PDF を読む](#スキャンした-pdf-を読むocr任意) |
 
 モデルの重みは [PLaMo Community License](https://plamo.preferredai.jp/info/plamo-community-license-ja) で公開されています。そのため、このリポジトリでは再配布せず、各自が Hugging Face から取得する形にしています。
 
@@ -181,7 +181,28 @@ python app.py --backend transformers
 
 ## スキャンした PDF を読む（OCR、任意）
 
-文字を持たないページ（スキャンした論文など）は、[Unlimited-OCR](https://huggingface.co/baidu/Unlimited-OCR)（Baidu、3B、MIT ライセンス）で読み取ってから翻訳できます。アプリとは transformers の版が合わないため、仮想環境を分けます（約 7 GB）。
+スキャンした論文や本は、OCR で文字を読み取ってから翻訳できます。OCR のエンジンは 2 つあり、両方入っていれば LightOnOCR-3 を使います。
+
+| エンジン | 大きさ・ライセンス | 動かし方 | 速さ（RTX 4060 Laptop） |
+|---|---|---|---|
+| **[LightOnOCR-3-0.8B](https://huggingface.co/lightonai/LightOnOCR-3-0.8B)**（推奨） | 0.9B、Apache-2.0 | 翻訳と同じ `.venv-vllm` の vLLM | 1 ページ約 2 秒（8 ページずつ並列） |
+| [Unlimited-OCR](https://huggingface.co/baidu/Unlimited-OCR) | 3B、MIT | 別の仮想環境 `.venv-ocr` の Transformers | 1 ページ約 40 秒 |
+
+### LightOnOCR-3（推奨）
+
+`.venv-vllm`（vLLM 0.32）があれば、モデルを取ってくるだけです（約 1.7 GB）。
+
+```bash
+.venv/bin/hf download lightonai/LightOnOCR-3-0.8B --local-dir ./model-lighton
+```
+
+- 日本語のスキャン本・英語の古い本（ScanSnap で読んだもの）で、見出し・段落・箇条書き・図の位置・キャプション・数式（`$\Gamma$` などの LaTeX）を正しく読めることを確かめました。
+- OCR のときだけ、ポート 8001 に OCR 用の vLLM サーバーを起動し、終わったら止めます（起動に約 50 秒）。
+- Transformers でも動きますが、Qwen3.5 系の線形アテンションの高速版（`flash-linear-attention`・`causal_conv1d`）が無いと 1 ページ 7 分かかったため、vLLM を使っています。
+
+### Unlimited-OCR（LightOnOCR-3 が使えない場合）
+
+アプリとは transformers の版が合わないため、仮想環境を分けます（約 7 GB）。
 
 ```bash
 python3 -m venv .venv-ocr
@@ -193,15 +214,22 @@ python3 -m venv .venv-ocr
   --exclude "model.safetensors" --exclude "wheel/*" --exclude "assets/*" --exclude "*.pdf"
 ```
 
-`.venv-ocr` と `model-ocr` があれば、PDF・文書翻訳タブで、スキャンしたページを自動で OCR します（オプションはありません）。
+vLLM でも動かそうとしましたが、8 GB の GPU には BF16 の重みが収まらず、FP8 にすると繰り返しの抑制が効かずに出力が止まらなくなったため、Transformers を使っています。
 
-- 文字をほとんど持たず、画像のあるページだけを OCR します。文字のあるページは、これまでどおり PDF の文字を使います。1 つの PDF に両方が混ざっていてもかまいません。
-- **OCR のあいだは、翻訳用の vLLM サーバーを止めます。** Unlimited-OCR は GPU メモリを約 6.8 GiB 使うため、8 GB の GPU では同時に動かせません。OCR が終わると自動で起動し直します（前後で 1 分ほど余分にかかります）。手動で起動した vLLM サーバー（`serve.sh`）や、Transformers で翻訳している場合は、GPU を空けられないので OCR は使えません。
-- 速さの目安（RTX 4060 Laptop）: 1 ページ約 40 秒です。スキャンした論文 3 ページの翻訳は、OCR と翻訳エンジンの再起動を含めて約 3 分でした。
-- OCR の結果は、見出し・段落・表・数式（LaTeX のまま、訳さない）・図（ページから切り出して埋め込む）に分けて、そのあとは通常の PDF と同じように処理します。
+### OCR するページ
+
+OCR のエンジンがあれば、PDF・文書翻訳タブで自動で OCR します（オプションはありません）。
+
+- **文字を持たないページ**（画像だけのページ）は OCR します。文字のあるページは、これまでどおり PDF の文字を使います。1 つの PDF に両方が混ざっていてもかまいません。
+- **スキャンの上に、すでに文字が載っているページ**（スキャナや Acrobat が OCR した PDF）は、LightOnOCR-3 があるときだけ、その文字の精度を確かめます。
+  - 文字の多いページを 3 ページ OCR し、PDF の文字の単語のうち OCR の結果にもあるものの割合（一致率）を出します。
+  - 一致率が 95% 未満なら、PDF の文字は精度が低いとみなし、そのページをすべて OCR し直します。95% 以上なら PDF の文字を使います。
+  - 実測では、ScanSnap（Hard Real-Time Computing Systems）は約 89%、Canon の My Image Garden（日本語の本）は約 91% で、どちらも OCR し直しました（`guaranteemechanism` のような語のくっつきや「ヤ1様は」→「皆様は」の読み違いが直ります）。
+- **OCR のあいだは、翻訳用の vLLM サーバーを止めます。** 8 GB の GPU では、OCR 用と翻訳用の 2 つの vLLM サーバーを同時に動かせません（翻訳側のメモリが足りず起動できませんでした）。OCR が終わると自動で起動し直します。
+- 手動で起動した vLLM サーバー（`serve.sh`）や、Transformers で翻訳している場合は、GPU を空けられないので OCR は使えません（文字の載ったスキャンは、そのまま PDF の文字で訳します）。
+- 時間の目安（LightOnOCR-3）: 文字の載った英語の本 5 ページで約 3 分、日本語の本 6 ページで約 2 分（OCR サーバーの起動、翻訳エンジンの停止・再起動、翻訳を含む）。ページが増えても、1 ページあたり約 2 秒しか増えません。
+- OCR の結果は、見出し・段落・箇条書き・表・数式（LaTeX のまま、訳さない）・図（ページから切り出して埋め込む）に分けて、そのあとは通常の PDF と同じように処理します。ページの上端に毎ページ出る柱（章名など）は見出しにしません。
 - OCR のログは `logs/ocr.log` に出ます。
-
-vLLM（`.venv-vllm`）でも動かそうとしましたが、8 GB の GPU には BF16 の重みが収まらず、FP8 にすると繰り返しの抑制が効かずに出力が止まらなくなったため、Transformers を使っています。
 
 ## 使い方
 
@@ -277,7 +305,7 @@ plamo-translator/
 ├── backends.py                   # 翻訳エンジン（vLLM サーバー / Transformers）
 ├── paper.py                      # PDF / Markdown → 章立ての抽出 → Markdown / HTML 出力（論文・書籍）
 ├── ocr.py                        # スキャンしたページの検出・OCR の呼び出し・OCR 結果の Markdown 化
-├── ocr_worker.py                 # OCR 本体（.venv-ocr で別プロセスとして動かす）
+├── ocr_worker.py                 # Unlimited-OCR の本体（.venv-ocr で別プロセスとして動かす）
 ├── serve.sh                      # vLLM サーバーの起動
 ├── quantize.py                   # Transformers 用モデルの 4bit / 8bit 量子化
 ├── requirements.txt              # アプリ（.venv）
@@ -287,12 +315,13 @@ plamo-translator/
 ├── BENCHMARK.md                  # 測定結果
 ├── model-fp8/                    # (git 管理外) FP8 版のモデル
 ├── model/, model-4bit/           # (git 管理外) Transformers 用のモデル
-└── model-ocr/                    # (git 管理外) OCR のモデル
+├── model-lighton/                # (git 管理外) OCR のモデル（LightOnOCR-3）
+└── model-ocr/                    # (git 管理外) OCR のモデル（Unlimited-OCR）
 ```
 
 ## 制限事項
 
-- **スキャンした PDF は、OCR を入れたときだけ翻訳できます。** OCR は 1 ページ約 40 秒かかり、読み違いもあります（ぼやけたスキャンでは `omitted` → `committed` のような誤りが出ました）。
+- **スキャンした PDF は、OCR を入れたときだけ翻訳できます。** 読み違いもあります（LightOnOCR-3 で「メモリ」→「メモり」、Unlimited-OCR でぼやけたスキャンの `omitted` → `committed` など）。
 - **図の中の文字は訳しません。** 図は画像として埋め込み、図の中から取り出した文字は捨てます（「図を埋め込む」をオフにすると、その文字も出力に残りません）。
 - **見出しが抜けることがあります。** 章立ては PDF の文字の大きさから判定しています（[pymupdf4llm](https://github.com/pymupdf/pymupdf4llm)）。見出しを取り出せなかった章は、前の章の中に入ります。
 - **2カラムの論文は、ページごとに「左カラム → 右カラム」の順に並べ直します。** 横幅いっぱいのタイトル・図表は区切りとして扱います。3カラム以上や、カラムの幅が左右で大きく違うレイアウトには対応していません。

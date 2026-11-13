@@ -702,11 +702,8 @@ def parse_blocks(md: str, mode: str = PAPER, title: Optional[str] = None) -> Lis
                 level, number, title = heading
                 # 1語だけの見出し（Rust, GEDF, MRM など）は文脈なしだと誤訳しやすい
                 # （例: "Rust" -> 「錆」）ので原文のままにする
-                single_word = (len(title.split()) == 1
-                               and not _KNOWN_SECTIONS.match(title)
-                               and not _COMMON_SINGLE_WORD_SECTIONS.match(title))
                 blocks.append(Block("heading", title, level=level, number=number,
-                                    translate=not single_word))
+                                    translate=_translatable_title(title)))
             else:
                 # 著者名・「TABLE II」などは見出し扱いしない
                 blocks.append(Block("para", text))
@@ -741,9 +738,13 @@ def parse_blocks(md: str, mode: str = PAPER, title: Optional[str] = None) -> Lis
 def _translatable_title(text: str) -> bool:
     """1語だけの見出し（Rust, GEDF, MRM など）は文脈なしだと誤訳しやすい
     （例: "Rust" -> 「錆」）ので原文のままにする。よく使われる一般的な章名は訳す"""
-    if len(text.split()) != 1:
+    if len(text.split()) != 1 or _CJK_CHARS.search(text):
+        # 日中韓の見出しは空白で語に分かれないので、1語かどうかでは判断しない
         return True
     return bool(_KNOWN_SECTIONS.match(text) or _COMMON_SINGLE_WORD_SECTIONS.match(text))
+
+
+_CJK_CHARS = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
 
 
 # ------------------------------------------------------------
