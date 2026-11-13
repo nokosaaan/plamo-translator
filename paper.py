@@ -76,6 +76,7 @@ def pdf_to_markdown(
             doc, force_text=True, image_dpi=image_dpi, **options
         )
         for page in parsed.pages:
+            fix_scanned_pictures(doc[page.page_number - 1], page, image_dpi, with_images)
             page.boxes = order_two_columns(page.boxes, page.width)
             if mode == DOCUMENT:
                 page.boxes = mark_side_notes(page.boxes)
@@ -285,6 +286,144 @@ def mark_side_notes(boxes):
         out.insert(max(positions) + 1, end)
         out.insert(min(positions), icon)
     return out
+
+
+def _is_scanned_with_text(page) -> bool:
+    """ページ全体が1枚の画像で、その上に（スキャナの OCR などの）文字が載っているページか"""
+    import pymupdf
+
+    area = page.rect.width * page.rect.height
+    return any(pymupdf.Rect(info["bbox"]).get_area() >= area * 0.9
+               for info in page.get_image_info())
+
+
+def _ink_bbox(page, region, dpi: int = 100, threshold: int = 180):
+    """region の中で、インク（暗い画素）のある範囲を返す。無ければ None"""
+    import numpy as np
+    import pymupdf
+
+    if region.is_empty or region.width < 4 or region.height < 4:
+        return None
+    pix = page.get_pixmap(clip=region, dpi=dpi, colorspace=pymupdf.csGRAY)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)[:, :pix.width]
+    dark = img < threshold
+    # スキャンのごみ（点）を拾わないよう、暗い画素が 2 つ以上ある行・列だけを数える
+    rows = np.where(dark.sum(axis=1) >= 2)[0]
+    cols = np.where(dark.sum(axis=0) >= 2)[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return None
+    sx, sy = region.width / pix.width, region.height / pix.height
+    return pymupdf.Rect(region.x0 + cols[0] * sx, region.y0 + rows[0] * sy,
+                        region.x0 + (cols[-1] + 1) * sx, region.y0 + (rows[-1] + 1) * sy)
+
+
+def fix_scanned_pictures(page, layout, image_dpi: int, with_images: bool, pad: float = 4) -> None:
+    """スキャンした本（全面画像＋OCR の文字）で、図の範囲を画素から求め直す
+
+    pymupdf4llm のレイアウト解析は、ページの文字と線（ベクター図形）から図の範囲を決める。
+    スキャンした PDF では図の線は画像の一部なので見えず、OCR が拾えた図中のラベルの範囲だけが
+    「図」になる（例: Hard Real-Time Computing Systems の図 2.14 で、右半分だけが切り出される）。
+    そこで、図の上下にある本文・キャプションの間を画像として調べ、インクのある範囲まで図を広げる。
+    """
+    import pymupdf
+
+    pictures = [b for b in layout.boxes if b.boxclass == "picture"]
+    if not pictures or not _is_scanned_with_text(page):
+        return
+    others = [b for b in layout.boxes if b.boxclass not in ("picture",) + _MARGIN_CLASSES]
+    body = [b for b in others if b.boxclass == "text"] or others
+    col_x0 = min((b.x0 for b in body), default=page.rect.x0 + 36)
+    col_x1 = max((b.x1 for b in body), default=page.rect.x1 - 36)
+    margins = [b for b in layout.boxes if b.boxclass in _MARGIN_CLASSES]
+    page_top = max((b.y1 for b in margins if b.y1 < page.rect.height / 2), default=page.rect.y0)
+    page_bottom = min((b.y0 for b in margins if b.y0 > page.rect.height / 2), default=page.rect.y1)
+
+    # レイアウト解析がキャプションや本文を見落とすことがあるので、文字の行からも境界を拾う:
+    # 「Figure 2.4 …」「図 3 …」のようなキャプションの行と、本文の幅の半分を超える行
+    caption_re = re.compile(r"^\s*(Fig(ure|\.)|Table|図|表)\s*\d", re.IGNORECASE)
+    lines = []
+    for block in page.get_text("dict")["blocks"]:
+        for line in block.get("lines", []):
+            text = "".join(s["text"] for s in line["spans"]).strip()
+            r = pymupdf.Rect(line["bbox"])
+            if text and (caption_re.match(text) or r.width > (col_x1 - col_x0) * 0.5):
+                lines.append(r)
+
+    # キャプションのかたまり（「Figure 2.9 Two tasks …」の 1〜2 行）
+    captions = [pymupdf.Rect(bl[:4]) for bl in page.get_text("blocks")
+                if bl[6] == 0 and caption_re.match(bl[4])]
+
+    def crop(rect):
+        if not with_images:
+            return None
+        pix = page.get_pixmap(clip=rect, dpi=image_dpi)
+        return None if pymupdf.IRect(pix.irect).is_empty else pix.tobytes("png")
+
+    def caption_box(rect):
+        from pymupdf4llm.helpers.document_layout import LayoutBox, get_raw_lines
+        box = LayoutBox(rect.x0, rect.y0, rect.x1, rect.y1, "caption")
+        box.textlines = [{"bbox": l[0], "spans": l[1]} for l in get_raw_lines(
+            textpage=None, blocks=layout.fulltext, clip=rect, ignore_invisible=False)]
+        return box
+
+    done = []
+    replace = {}      # 図の箱 -> 置き換える箱の列（キャプションで分けたとき）
+    for pic in pictures:
+        rect = pymupdf.Rect(pic.x0, pic.y0, pic.x1, pic.y1)
+        # 図の上下で、いちばん近い本文・キャプション・表などの端までを調べる範囲にする
+        bounds = [pymupdf.Rect(b.x0, b.y0, b.x1, b.y1) for b in others]
+        bounds += [r for r in lines if not r.intersects(rect)]
+        above = [r.y1 for r in bounds if r.y1 <= rect.y0 + 2]
+        below = [r.y0 for r in bounds if r.y0 >= rect.y1 - 2]
+        top = max(above, default=page_top) + 1
+        bottom = min(below, default=page_bottom) - 1
+        region = pymupdf.Rect(min(col_x0, rect.x0) - pad, top, max(col_x1, rect.x1) + pad, bottom)
+        region &= page.rect
+        ink = _ink_bbox(page, region)
+        if ink is None:
+            continue
+        new = (rect | ink) + (-pad, -pad, pad, pad)
+        new &= region | rect
+        # 同じ図の一部として検出された別の図の範囲は、1つにまとめる
+        if any(abs(new & d) >= 0.8 * abs(new) for d in done):
+            pic.boxclass = "_merged"
+            continue
+        done.append(new)
+        # 広げた図の中にある、図のラベルの文字（本文として訳されてしまう）を除く
+        for b in layout.boxes:
+            if b is not pic and b.boxclass in ("text", "picture") and \
+                    pymupdf.Rect(b.x0, b.y0, b.x1, b.y1) in new:
+                b.boxclass = "_merged"
+
+        # レイアウト解析が、キャプションごと（ときには上下 2 つの図をまとめて）1 つの図に
+        # することがある。図の中にあるキャプションで上下に分け、キャプションは文章として訳す
+        inner = sorted((c for c in captions if abs(c & new) >= 0.8 * abs(c)), key=lambda c: c.y0)
+        if not inner:
+            pic.x0, pic.y0, pic.x1, pic.y1 = new.x0, new.y0, new.x1, new.y1
+            pic.image = crop(new)
+            continue
+        parts, y = [], new.y0
+        for cap in inner + [None]:
+            seg = pymupdf.Rect(new.x0, y, new.x1, cap.y0 - 1 if cap else new.y1)
+            seg_ink = _ink_bbox(page, seg)
+            if seg_ink is not None and seg_ink.height > 8:
+                fig = (seg_ink + (-pad, -pad, pad, pad)) & seg
+                from pymupdf4llm.helpers.document_layout import LayoutBox
+                box = LayoutBox(fig.x0, fig.y0, fig.x1, fig.y1, "picture")
+                box.image = crop(fig)
+                box.textlines = []
+                parts.append(box)
+            if cap:
+                parts.append(caption_box(cap))
+                y = cap.y1 + 1
+        replace[id(pic)] = parts
+
+    boxes = []
+    for b in layout.boxes:
+        if b.boxclass == "_merged":
+            continue
+        boxes.extend(replace.get(id(b), [b]))
+    layout.boxes = boxes
 
 
 def order_two_columns(boxes, page_width):
