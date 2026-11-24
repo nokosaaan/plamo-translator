@@ -917,7 +917,11 @@ def _original_details(text: str) -> str:
     return f"<details><summary>原文</summary>\n\n{text}\n\n</details>"
 
 
-def render_markdown(blocks: List[Block], source_name: str, bilingual: bool = False) -> str:
+def render_markdown(blocks: List[Block], source_name: str, bilingual: bool = False,
+                    note: Optional[str] = None) -> str:
+    """note は題の下に入れる一言。None なら「翻訳元: …（機械翻訳）」、空文字なら入れない"""
+    if note is None:
+        note = f"翻訳元: `{source_name}`（PLaMo 3 Translate による機械翻訳）"
     out: List[str] = []
     pending_originals: List[str] = []   # 箇条書きの原文はリストの後ろにまとめる
     prev_kind = ""
@@ -935,7 +939,8 @@ def render_markdown(blocks: List[Block], source_name: str, bilingual: bool = Fal
             out.append(f"# {b.translated or b.text}")
             if b.translated:
                 out.append(f"*{b.text}*")
-            out.append(f"> 翻訳元: `{source_name}`（PLaMo 3 Translate による機械翻訳）")
+            if note:
+                out.append(f"> {note}")
         elif b.kind == "heading":
             out.append(_heading_line(b))
         elif b.kind in ("table", "image"):

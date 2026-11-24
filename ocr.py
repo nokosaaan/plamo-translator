@@ -520,6 +520,9 @@ def lighton_to_markdown(text: str, page=None, with_images: bool = True, image_dp
             md = re.sub(r"^#+\s*", "", body)
         elif kind == "title":
             md = body if body.startswith("#") else "# " + " ".join(body.split())
+        elif kind == "code":
+            # プログラムは訳さず、そのまま残す
+            md = "```\n" + body.rstrip() + "\n```"
         elif kind == "list":
             # 箇条書きの項目は 1 つずつ段落にする（paper.py は空行で項目を分ける）
             md = re.sub(r"\n(?=\s*([-*•・]|\d+[.)])\s)", "\n\n", body)

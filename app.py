@@ -17,6 +17,7 @@ import gradio as gr
 
 import ocr
 from detect_lang import detect_language
+import latex
 import paper
 from backends import TransformersBackend, VllmBackend, VllmServer, find_vllm_models
 
@@ -617,12 +618,14 @@ def _slug(title, max_len=40):
 
 def translate_files(files, source_lang, target_lang, form, formats,
                     bilingual, with_images, translate_refs, mode, page_range, image_dpi,
-                    chapter_ids, split_chapters, ocr_range="", progress=gr.Progress()):
+                    chapter_ids, split_chapters, ocr_range="", no_translate=False,
+                    progress=gr.Progress()):
+    """no_translate なら翻訳せず、PDF を Markdown / HTML / LaTeX に変換するだけにする"""
     if not files:
         raise gr.Error("ファイルを選択してください。")
     if not formats:
         raise gr.Error("出力形式を1つ以上選んでください。")
-    backend = get_backend()
+    backend = None if no_translate else get_backend()
 
     output_dir = tempfile.mkdtemp(prefix="plamo_")
     output_files = []
@@ -663,23 +666,31 @@ def translate_files(files, source_lang, target_lang, form, formats,
             progress(done / total, desc=f"{prefix}: 翻訳中 ({done}/{total} 段落)")
 
         # 章ごとに分けて出す場合も、翻訳は全章まとめて投げる（vLLM で並列に処理できる）
-        paper.translate_blocks(
-            all_blocks,
-            lambda texts, cb: backend.translate_many(
-                texts, source_lang, target_lang, form, progress=cb
-            ),
-            translate_references=translate_refs,
-            progress=on_progress,
-        )
+        if not no_translate:
+            paper.translate_blocks(
+                all_blocks,
+                lambda texts, cb: backend.translate_many(
+                    texts, source_lang, target_lang, form, progress=cb
+                ),
+                translate_references=translate_refs,
+                progress=on_progress,
+            )
+        # 翻訳しないときは、題の下の「機械翻訳」の注記を入れない
+        note = "" if no_translate else None
+        tex_note = None if no_translate else f"翻訳元: {name}（PLaMo 3 Translate による機械翻訳）"
+        suffix = "" if no_translate else f"_{target_lang}"
 
         for unit_name, blocks in units:
-            md_text = paper.render_markdown(blocks, name, bilingual=bilingual)
+            md_text = paper.render_markdown(blocks, name, bilingual=bilingual and not no_translate,
+                                            note=note)
             title = next((b.translated or b.text for b in blocks if b.kind == "title"), stem)
             if unit_name:
                 chapter = next((b for b in blocks if b.kind == "heading"), None)
                 if chapter:
                     title = f"{chapter.translated or chapter.text} - {title}"
-            base = f"{stem}_{unit_name}_ja" if unit_name else f"{stem}_ja"
+            base = f"{stem}_{unit_name}{suffix}" if unit_name else f"{stem}{suffix}"
+            if no_translate:
+                base += "_converted"
 
             if "Markdown" in formats:
                 out = os.path.join(output_dir, f"{base}.md")
@@ -691,6 +702,18 @@ def translate_files(files, source_lang, target_lang, form, formats,
                 out = os.path.join(output_dir, f"{base}.html")
                 with open(out, "w", encoding="utf-8") as f:
                     f.write(paper.render_html(md_text, title))
+                output_files.append(out)
+
+            if "LaTeX" in formats:
+                # .tex と図（figures/）を1つの ZIP にまとめる（lualatex でコンパイルする）
+                tex, figures = latex.render_latex(blocks, f"{base}.tex",
+                                                  bilingual=bilingual and not no_translate,
+                                                  note=tex_note)
+                out = os.path.join(output_dir, f"{base}_tex.zip")
+                with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+                    z.writestr(f"{base}/{base}.tex", tex)
+                    for fig_name, data in figures:
+                        z.writestr(f"{base}/figures/{fig_name}", data)
                 output_files.append(out)
 
             if not preview:
@@ -961,11 +984,13 @@ with gr.Blocks(title="PLaMo Translator") as demo:
         )
         with gr.Row():
             p_formats = gr.CheckboxGroup(
-                ["HTML", "Markdown"], value=["HTML", "Markdown"], label="出力形式"
+                ["HTML", "Markdown", "LaTeX"], value=["HTML", "Markdown"],
+                label="出力形式（LaTeX は .tex と図の ZIP。lualatex でコンパイル）"
             )
             p_bilingual = gr.Checkbox(True, label="段落ごとに原文を併記（折りたたみ）")
             p_images = gr.Checkbox(True, label="図を埋め込む")
             p_refs = gr.Checkbox(False, label="参考文献も翻訳する（論文）")
+            p_no_translate = gr.Checkbox(False, label="翻訳しない（形式の変換だけ）")
 
         pdf_input = gr.File(
             label="翻訳するファイルを選択（PDF / Markdown / テキスト）",
@@ -999,7 +1024,7 @@ with gr.Blocks(title="PLaMo Translator") as demo:
             fn=start_pdf_job,
             inputs=[pdf_input, p_source, p_target, p_form, p_formats,
                     p_bilingual, p_images, p_refs, p_mode, p_pages, p_dpi,
-                    p_chapters, p_split, p_ocr_pages, p_shown],
+                    p_chapters, p_split, p_ocr_pages, p_no_translate, p_shown],
             outputs=[job_status, output_file, preview_md, p_shown],
             queue=False,
         )
