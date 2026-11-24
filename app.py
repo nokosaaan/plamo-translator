@@ -619,7 +619,7 @@ def _slug(title, max_len=40):
 def translate_files(files, source_lang, target_lang, form, formats,
                     bilingual, with_images, translate_refs, mode, page_range, image_dpi,
                     chapter_ids, split_chapters, ocr_range="", no_translate=False,
-                    progress=gr.Progress()):
+                    tex_split=True, progress=gr.Progress()):
     """no_translate なら翻訳せず、PDF を Markdown / HTML / LaTeX に変換するだけにする"""
     if not files:
         raise gr.Error("ファイルを選択してください。")
@@ -705,15 +705,15 @@ def translate_files(files, source_lang, target_lang, form, formats,
                 output_files.append(out)
 
             if "LaTeX" in formats:
-                # .tex と図（figures/）を1つの ZIP にまとめる（lualatex でコンパイルする）
-                tex, figures = latex.render_latex(blocks, f"{base}.tex",
-                                                  bilingual=bilingual and not no_translate,
-                                                  note=tex_note)
+                # main.tex・src/（章ごと）・reference.bib・figures/ を1つの ZIP にまとめる
+                # （pdflatex でも lualatex でもコンパイルできる）
+                project = latex.render_latex_project(
+                    blocks, name, bilingual=bilingual and not no_translate,
+                    note=tex_note, split=tex_split)
                 out = os.path.join(output_dir, f"{base}_tex.zip")
                 with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-                    z.writestr(f"{base}/{base}.tex", tex)
-                    for fig_name, data in figures:
-                        z.writestr(f"{base}/figures/{fig_name}", data)
+                    for rel, data in project.items():
+                        z.writestr(f"{base}/{rel}", data)
                 output_files.append(out)
 
             if not preview:
@@ -985,12 +985,13 @@ with gr.Blocks(title="PLaMo Translator") as demo:
         with gr.Row():
             p_formats = gr.CheckboxGroup(
                 ["HTML", "Markdown", "LaTeX"], value=["HTML", "Markdown"],
-                label="出力形式（LaTeX は .tex と図の ZIP。lualatex でコンパイル）"
+                label="出力形式（LaTeX は main.tex・章ごとの .tex・reference.bib・図の ZIP。pdflatex でコンパイル）"
             )
             p_bilingual = gr.Checkbox(True, label="段落ごとに原文を併記（折りたたみ）")
             p_images = gr.Checkbox(True, label="図を埋め込む")
             p_refs = gr.Checkbox(False, label="参考文献も翻訳する（論文）")
             p_no_translate = gr.Checkbox(False, label="翻訳しない（形式の変換だけ）")
+            p_tex_split = gr.Checkbox(True, label="LaTeX を章ごとのファイルに分ける（main.tex から \\input）")
 
         pdf_input = gr.File(
             label="翻訳するファイルを選択（PDF / Markdown / テキスト）",
@@ -1024,7 +1025,7 @@ with gr.Blocks(title="PLaMo Translator") as demo:
             fn=start_pdf_job,
             inputs=[pdf_input, p_source, p_target, p_form, p_formats,
                     p_bilingual, p_images, p_refs, p_mode, p_pages, p_dpi,
-                    p_chapters, p_split, p_ocr_pages, p_no_translate, p_shown],
+                    p_chapters, p_split, p_ocr_pages, p_no_translate, p_tex_split, p_shown],
             outputs=[job_status, output_file, preview_md, p_shown],
             queue=False,
         )
